@@ -14,6 +14,12 @@ import os
 from util.aes_help import encrypt_data, decrypt_data
 import util.zepp_helper as zeppHelper
 import util.push_util as push_util
+import requests
+
+# 单账号最大尝试次数：zepp_helper 内部已有单请求级别的超时重试，
+# 这里再兜底一层账号级别的重试，避免偶发网络异常直接丢掉一个账号当天的步数
+ACCOUNT_MAX_ATTEMPTS = 2
+ACCOUNT_RETRY_WAIT_SECONDS = 5
 
 try:
     from dotenv import load_dotenv
@@ -173,7 +179,7 @@ class MiMotionRunner:
         user_token_info["login_token_time"] = get_time()
         user_token_info["app_token_time"] = get_time()
         if self.device_id is None:
-            self.device_id = uuid.uuid4()
+            self.device_id = str(uuid.uuid4())
         user_token_info["device_id"] = self.device_id
         user_tokens[self.user] = user_token_info
         return app_token
@@ -207,18 +213,40 @@ def run_single_account(total, idx, user_mi, passwd_mi):
     if idx is not None:
         idx_info = f"[{idx + 1}/{total}]"
     log_str = f"[{format_now()}]\n{idx_info}账号：{desensitize_user_name(user_mi)}\n"
-    try:
+    start_time = time.time()
+    attempt = 1
+    while True:
         runner = MiMotionRunner(user_mi, passwd_mi)
-        exec_msg, success = runner.login_and_post_step(min_step, max_step)
-        log_str += runner.log_str
-        log_str += f'{exec_msg}\n'
-        exec_result = {"user": user_mi, "success": success,
-                       "msg": exec_msg}
-    except:
-        log_str += f"执行异常:{traceback.format_exc()}\n"
-        log_str += traceback.format_exc()
-        exec_result = {"user": user_mi, "success": False,
-                       "msg": f"执行异常:{traceback.format_exc()}"}
+        try:
+            exec_msg, success = runner.login_and_post_step(min_step, max_step)
+            log_str += runner.log_str
+            log_str += f'{exec_msg}\n'
+            exec_result = {"user": user_mi, "success": success,
+                           "msg": exec_msg}
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # 网络异常：zepp_helper 内已重试过，仍然失败则整体重试该账号
+            log_str += runner.log_str
+            next_attempt = attempt + 1
+            if attempt < ACCOUNT_MAX_ATTEMPTS:
+                wait_seconds = ACCOUNT_RETRY_WAIT_SECONDS * attempt
+                log_str += f"网络异常({type(e).__name__}: {e})，{wait_seconds}秒后整体重试该账号(第{next_attempt}次)\n"
+                attempt = next_attempt
+                time.sleep(wait_seconds)
+                continue
+            log_str += f"执行异常:{type(e).__name__}: {e}\n"
+            exec_result = {"user": user_mi, "success": False,
+                           "msg": f"网络异常:{type(e).__name__}: {e}"}
+            break
+        except Exception:
+            log_str += runner.log_str
+            # 统一只打印一次异常堆栈，避免同一个堆栈在日志里出现两遍
+            error_stack = traceback.format_exc()
+            log_str += f"执行异常:{error_stack}\n"
+            exec_result = {"user": user_mi, "success": False,
+                           "msg": f"执行异常:{error_stack}"}
+            break
+    log_str += f"耗时：{time.time() - start_time:.1f}秒\n"
     print(log_str)
     return exec_result
 
@@ -227,13 +255,15 @@ def execute():
     user_list = users.split('#')
     passwd_list = passwords.split('#')
     exec_results = []
+    start_time = time.time()
     if len(user_list) == len(passwd_list):
         idx, total = 0, len(user_list)
         if use_concurrent:
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as executor:
-                exec_results = executor.map(lambda x: run_single_account(total, x[0], *x[1]),
-                                            enumerate(zip(user_list, passwd_list)))
+                # 必须转成list立即消费结果，否则并发任务还没执行完就会先执行下面的持久化token逻辑
+                exec_results = list(executor.map(lambda x: run_single_account(total, x[0], *x[1]),
+                                                 enumerate(zip(user_list, passwd_list))))
         else:
             for user_mi, passwd_mi in zip(user_list, passwd_list):
                 exec_results.append(run_single_account(total, idx, user_mi, passwd_mi))
@@ -249,7 +279,7 @@ def execute():
             push_results.append(result)
             if result['success'] is True:
                 success_count += 1
-        summary = f"\n执行账号总数{total}，成功：{success_count}，失败：{total - success_count}"
+        summary = f"\n执行账号总数{total}，成功：{success_count}，失败：{total - success_count}，总耗时：{time.time() - start_time:.1f}秒"
         print(summary)
         push_util.push_results(push_results, summary, push_config)
     else:
