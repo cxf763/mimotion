@@ -11,6 +11,52 @@ import requests
 
 from util.aes_help import encrypt_data, HM_AES_KEY, HM_AES_IV
 
+# 网络请求统一超时与重试配置。
+# 2026-11-06 23:54 的运行日志中，账号1 的请求因未设置超时挂起了约 39 分钟，
+# 最终以 ConnectionResetError 失败，导致整个任务跑了 41 分钟并且该账号当天没有刷上步数。
+# 因此这里统一加上超时，并对连接重置/超时/网关错误做有限次数的退避重试。
+REQUEST_TIMEOUT = (8, 20)  # (连接超时, 读取超时) 秒
+REQUEST_RETRIES = 3        # 单个请求最多尝试次数
+RETRY_BACKOFF_SECONDS = 2  # 重试退避基数：2s、4s
+
+_RETRYABLE_EXCEPTIONS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+    requests.exceptions.ContentDecodingError,
+)
+
+
+def request_with_retry(method, url, **kwargs):
+    """带超时和退避重试的请求方法，避免网络抖动直接导致账号执行失败"""
+    kwargs.setdefault('timeout', REQUEST_TIMEOUT)
+    last_error = None
+    for attempt in range(1, REQUEST_RETRIES + 1):
+        try:
+            response = requests.request(method, url, **kwargs)
+            if response.status_code in (500, 502, 503, 504) and attempt < REQUEST_RETRIES:
+                wait_seconds = RETRY_BACKOFF_SECONDS * attempt
+                print(f"请求[{method} {url}] 返回 {response.status_code}，{wait_seconds}秒后第{attempt + 1}次重试")
+                time.sleep(wait_seconds)
+                continue
+            return response
+        except _RETRYABLE_EXCEPTIONS as e:
+            last_error = e
+            if attempt >= REQUEST_RETRIES:
+                break
+            wait_seconds = RETRY_BACKOFF_SECONDS * attempt
+            print(f"请求[{method} {url}] 网络异常({type(e).__name__}: {e})，{wait_seconds}秒后第{attempt + 1}次重试")
+            time.sleep(wait_seconds)
+    raise last_error
+
+
+def response_to_json(response, error_prefix):
+    """安全解析响应JSON，避免接口异常返回非JSON内容时抛出无意义的堆栈"""
+    try:
+        return response.json(), None
+    except ValueError:
+        return None, f"{error_prefix}，status: {response.status_code}，返回内容非JSON"
+
 
 # 通过账号密码获取access_token和refresh_token 但是refresh_token不知道怎么使用
 def login_access_token(user, password) -> (str | None, str | None):
@@ -39,7 +85,7 @@ def login_access_token(user, password) -> (str | None, str | None):
     cipher_data = encrypt_data(plaintext, HM_AES_KEY, HM_AES_IV)
 
     url1 = 'https://api-user.zepp.com/v2/registrations/tokens'
-    r1 = requests.post(url1, data=cipher_data, headers=headers, allow_redirects=False, timeout=5)
+    r1 = request_with_retry('POST', url1, data=cipher_data, headers=headers, allow_redirects=False)
     if r1.status_code != 303:
         return None, "登录异常，status: %d" % r1.status_code
     try:
@@ -127,7 +173,10 @@ def grant_login_tokens(access_token, device_id, is_phone=False) -> (str | None, 
             "source": "com.xiaomi.hm.health:6.14.0:50818",
             "third_name": "email",
         }
-    resp = requests.post(url, data=data, headers=headers).json()
+    response = request_with_retry('POST', url, data=data, headers=headers)
+    resp, parse_error = response_to_json(response, "客户端登录返回解析失败")
+    if parse_error:
+        return None, None, None, parse_error
     # print("请求客户端登录成功：%s" % json.dumps(resp, ensure_ascii=False, indent=2))  #
     _login_token, _userid, _app_token = None, None, None
     try:
@@ -139,6 +188,7 @@ def grant_login_tokens(access_token, device_id, is_phone=False) -> (str | None, 
         _userid = resp["token_info"]["user_id"]
     except:
         print("提取login_token失败：%s" % json.dumps(resp, ensure_ascii=False, indent=2))
+        return None, None, None, "提取login_token失败"
     return _login_token, _app_token, _userid, None
 
 
@@ -146,10 +196,12 @@ def grant_login_tokens(access_token, device_id, is_phone=False) -> (str | None, 
 def grant_app_token(login_token: str) -> (str | None, str | None):
     url = f"https://account-cn.huami.com/v1/client/app_tokens?app_name=com.xiaomi.hm.health&dn=api-user.huami.com%2Capi-mifit.huami.com%2Capp-analytics.huami.com&login_token={login_token}"
     headers = {'User-Agent': 'MiFit/5.3.0 (iPhone; iOS 14.7.1; Scale/3.00)'}
-    resp = requests.get(url, headers=headers)
+    resp = request_with_retry('GET', url, headers=headers)
     if resp.status_code != 200:
         return None, "请求异常：%d" % resp.status_code
-    resp = resp.json()
+    resp, parse_error = response_to_json(resp, "获取app_token返回解析失败")
+    if parse_error:
+        return None, parse_error
     print("grant_app_token: %s" % json.dumps(resp))
 
     result = resp.get("result")
@@ -195,11 +247,13 @@ def check_app_token(app_token) -> (bool, str | None):
         "lang": "zh_CN",
         "clientid": "428135909242707968"
     }
-    response = requests.get(url, params=params, headers=headers)
+    response = request_with_retry('GET', url, params=params, headers=headers)
     if response.status_code != 200:
         return False, "请求异常：%d" % response.status_code
-    response = response.json()
-    message = response["message"]
+    response, parse_error = response_to_json(response, "检查app_token返回解析失败")
+    if parse_error:
+        return False, parse_error
+    message = response.get("message")
     if message == "success":
         return True, None
     else:
@@ -228,11 +282,13 @@ def renew_login_token(login_token) -> (str | None, str | None):
         "appplatform": "android_phone"
     }
 
-    resp = requests.get(url, params=params, headers=headers)
+    resp = request_with_retry('GET', url, params=params, headers=headers)
     if resp.status_code != 200:
         return None, "请求异常：%d" % resp.status_code
-    resp = resp.json()
-    result = resp["result"]
+    resp, parse_error = response_to_json(resp, "刷新login_token返回解析失败")
+    if parse_error:
+        return None, parse_error
+    result = resp.get("result")
 
     if result != "ok":
         return None, "请求失败：%s" % result
@@ -248,7 +304,11 @@ def get_user_device_id(app_token, userid) -> str | None:
         "User-Agent": "MiFit6.14.0 (M2007J1SC; Android 12; Density/2.75)"
     }
     try:
-        resp = requests.get(url, headers=headers, timeout=5).json()
+        response = request_with_retry('GET', url, headers=headers, timeout=(5, 15))
+        resp, parse_error = response_to_json(response, "查询设备列表返回解析失败")
+        if parse_error:
+            print(f"查询设备列表失败: {parse_error}")
+            return None
         items = resp.get("items", [])
         if items:
             # 1. 优先匹配 deviceType == 0 (手环/手表)
@@ -294,11 +354,13 @@ def post_fake_brand_data(step, app_token, userid, device_id=None):
 
     data = f'userid={userid}&last_sync_data_time=1597306380&device_type=0&last_deviceid={target_dev_id}&data_json={data_json}'
 
-    response = requests.post(url, data=data, headers=head)
+    response = request_with_retry('POST', url, data=data, headers=head)
     if response.status_code != 200:
         return False, "请求修改步数异常：%d" % response.status_code
-    response = response.json()
-    message = response["message"]
+    response, parse_error = response_to_json(response, "修改步数返回解析失败")
+    if parse_error:
+        return False, parse_error
+    message = response.get("message")
     if message == "success":
         return True, message
     else:
