@@ -247,7 +247,11 @@ def check_app_token(app_token) -> (bool, str | None):
         "lang": "zh_CN",
         "clientid": "428135909242707968"
     }
-    response = request_with_retry('GET', url, params=params, headers=headers)
+    try:
+        response = request_with_retry('GET', url, params=params, headers=headers)
+    except requests.exceptions.RequestException as e:
+        # 校验token只是可选的加速步骤，网络异常不能直接让账号失败，返回False让上层走刷新token/重新登录流程
+        return False, "检查app_token请求异常：%s: %s" % (type(e).__name__, e)
     if response.status_code != 200:
         return False, "请求异常：%d" % response.status_code
     response, parse_error = response_to_json(response, "检查app_token返回解析失败")
